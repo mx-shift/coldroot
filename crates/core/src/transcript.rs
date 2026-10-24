@@ -57,124 +57,17 @@ impl Anchor {
     }
 }
 
-/// Index into the participant list declared when the ceremony starts.
-pub type ParticipantId = u8;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    Operator,
-    Witness,
-    /// Holder of the wrap key share with this index.
-    Custodian(u8),
-}
-
+/// Someone present at the ceremony.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Participant {
     pub name: String,
-    pub role: Role,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CeremonyKind {
-    Init,
-    Sign,
-    IssueCrl,
-    Reshare,
-    RestoreDrill,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "media", rename_all = "snake_case")]
-pub enum Media {
-    Os,
-    State { generation: u64 },
-    Requests,
-    Output,
-}
-
-/// What a participant attested to.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "confirmed", rename_all = "snake_case")]
-pub enum Confirmation {
-    /// The system clock matches an independent time source.
-    ClockCorrect,
-    /// The hash shown for this media matches the hash on its label or record.
-    MediaHashMatches { media: Media },
-    /// The custodian recorded their share and took custody of it.
-    ShareRecorded { custodian: u8 },
-    /// The fingerprint of a newly generated public key was recorded.
-    PublicKeyRecorded { key_id: u16 },
-    /// The stated reason justifies entering exception mode.
-    ExceptionJustified,
-}
-
-/// A state-changing operation on the HSM or CA.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum Operation {
-    InstallWrapKey,
-    GenerateKey {
-        key_id: u16,
-        label: String,
-        algorithm: String,
-        #[serde(with = "hex::serde")]
-        public_key_sha256: Hash,
-    },
-    ImportWrapped {
-        key_id: u16,
-    },
-    ExportWrapped {
-        key_id: u16,
-        #[serde(with = "hex::serde")]
-        blob_sha256: Hash,
-    },
-    SignCertificate {
-        key_id: u16,
-        profile: String,
-        serial: String,
-        #[serde(with = "hex::serde")]
-        request_sha256: Hash,
-        #[serde(with = "hex::serde")]
-        certificate_sha256: Hash,
-    },
-    IssueCrl {
-        key_id: u16,
-        number: u64,
-        #[serde(with = "hex::serde")]
-        crl_sha256: Hash,
-    },
-    ResetHsm {
-        serial: u32,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     CeremonyStarted {
-        ceremony: CeremonyKind,
         participants: Vec<Participant>,
-    },
-    MediaRead {
-        media: Media,
-        #[serde(with = "hex::serde")]
-        sha256: Hash,
-    },
-    Confirmed {
-        by: ParticipantId,
-        what: Confirmation,
-    },
-    ShareAccepted {
-        custodian: u8,
-        by: ParticipantId,
-    },
-    Performed(Operation),
-    MediaWritten {
-        media: Media,
-        #[serde(with = "hex::serde")]
-        sha256: Hash,
     },
     ExceptionStarted {
         reason: String,
@@ -193,7 +86,7 @@ pub struct Entry {
     pub seq: u64,
     #[serde(with = "hex::serde")]
     pub prev: Hash,
-    /// Ceremony machine clock, set by hand and confirmed at ceremony start.
+    /// Ceremony machine clock, which is set by hand before the ceremony.
     pub time: Timestamp,
     pub event: Event,
 }
@@ -215,8 +108,6 @@ pub enum TranscriptError {
     BrokenChain { seq: u64 },
     #[error("entry {seq} is out of order: {reason}")]
     Malformed { seq: u64, reason: &'static str },
-    #[error("entry {seq} names unknown participant {id}")]
-    UnknownParticipant { seq: u64, id: ParticipantId },
     #[error("entry {seq} is earlier than the entry before it")]
     TimeWentBackwards { seq: u64 },
 }
@@ -233,7 +124,6 @@ enum Phase {
 #[derive(Debug)]
 struct Grammar {
     phase: Phase,
-    participants: usize,
     last_time: Option<Timestamp>,
 }
 
@@ -241,7 +131,6 @@ impl Grammar {
     fn new() -> Self {
         Self {
             phase: Phase::NotStarted,
-            participants: 0,
             last_time: None,
         }
     }
@@ -254,20 +143,11 @@ impl Grammar {
         if self.last_time.is_some_and(|t| time < t) {
             return Err(TranscriptError::TimeWentBackwards { seq });
         }
-        let check_id = |id: ParticipantId| {
-            if (id as usize) < self.participants {
-                Ok(())
-            } else {
-                Err(TranscriptError::UnknownParticipant { seq, id })
-            }
-        };
-
         let next = match (self.phase, event) {
-            (NotStarted, Event::CeremonyStarted { participants, .. }) => {
-                if participants.is_empty() || participants.len() > ParticipantId::MAX as usize {
-                    return malformed("participant list must have 1 to 255 entries");
+            (NotStarted, Event::CeremonyStarted { participants }) => {
+                if participants.is_empty() {
+                    return malformed("a ceremony needs at least one participant");
                 }
-                self.participants = participants.len();
                 Running
             }
             (NotStarted, _) => return malformed("first event must be ceremony_started"),
@@ -288,16 +168,6 @@ impl Grammar {
                 return malformed("exception must end before the ceremony");
             }
             (Running, Event::CeremonyEnded) => Ended,
-
-            (phase, Event::Confirmed { by, .. }) => {
-                check_id(*by)?;
-                phase
-            }
-            (phase, Event::ShareAccepted { by, .. }) => {
-                check_id(*by)?;
-                phase
-            }
-            (phase, _) => phase,
         };
         self.phase = next;
         self.last_time = Some(time);
@@ -403,15 +273,12 @@ mod tests {
 
     fn started() -> Event {
         Event::CeremonyStarted {
-            ceremony: CeremonyKind::Init,
             participants: vec![
                 Participant {
                     name: "Operator".into(),
-                    role: Role::Operator,
                 },
                 Participant {
-                    name: "Custodian One".into(),
-                    role: Role::Custodian(1),
+                    name: "Witness".into(),
                 },
             ],
         }
@@ -422,22 +289,20 @@ mod tests {
         tr.append_at(t(0), started()).unwrap();
         tr.append_at(
             t(1),
-            Event::Confirmed {
-                by: 1,
-                what: Confirmation::ClockCorrect,
+            Event::ExceptionStarted {
+                reason: "re-sign expired CRL".into(),
             },
         )
         .unwrap();
         tr.append_at(
             t(2),
-            Event::ShareAccepted {
-                custodian: 1,
-                by: 1,
+            Event::ExceptionCommand {
+                argv: vec!["coldroot".into(), "crl".into()],
+                exit_status: 0,
             },
         )
         .unwrap();
-        tr.append_at(t(3), Event::Performed(Operation::InstallWrapKey))
-            .unwrap();
+        tr.append_at(t(3), Event::ExceptionEnded).unwrap();
         tr.append_at(t(4), Event::CeremonyEnded).unwrap();
         tr
     }
@@ -463,9 +328,9 @@ mod tests {
     fn tamper_is_detected() {
         let a = genesis();
         let mut entries = sample(&a).entries().to_vec();
-        entries[2].event = Event::ShareAccepted {
-            custodian: 2,
-            by: 1,
+        entries[2].event = Event::ExceptionCommand {
+            argv: vec!["coldroot".into(), "sign".into()],
+            exit_status: 0,
         };
         assert_eq!(
             verify(&a, &entries),
@@ -572,23 +437,6 @@ mod tests {
             exit_status: 0,
         };
         assert!(tr.append_at(t(1), cmd).is_err());
-    }
-
-    #[test]
-    fn unknown_participant_is_refused() {
-        let mut tr = Transcript::new(&genesis());
-        tr.append_at(t(0), started()).unwrap();
-        assert_eq!(
-            tr.append_at(
-                t(1),
-                Event::Confirmed {
-                    by: 7,
-                    what: Confirmation::ClockCorrect
-                }
-            )
-            .unwrap_err(),
-            TranscriptError::UnknownParticipant { seq: 1, id: 7 }
-        );
     }
 
     #[test]
