@@ -1,0 +1,25 @@
+[package]
+name = "coldroot-ceremony"
+description = "The ceremonies coldroot runs: fixed step sequences over the transcript, shares and HSM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+coldroot-core = { path = "../core" }
+coldroot-hsm = { path = "../hsm" }
+hex = { version = "0.4.3", features = ["serde"] }
+jiff = "0.2.38"
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10"
+thiserror = "2.0.21"
+yubihsm = { version = "0.42.1", features = ["usb"] }
+zeroize = "1.9.1"
+
+[dev-dependencies]
+yubihsm = { version = "0.42.1", features = ["mockhsm", "usb"] }
