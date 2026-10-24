@@ -3,13 +3,16 @@
 //! A ceremony is a fixed sequence of steps over three things: the hash-chained
 //! transcript, the custodians' shares, and an HSM that is empty when the
 //! ceremony starts and empty again when it ends. The operator and witnesses
-//! take part through a [`Console`], which the TUI implements; tests script it.
+//! take part through a [`Console`], which the TUI implements and tests script;
+//! the device is reached through an [`Hsm`], which `coldroot-hsm` implements
+//! for the YubiHSM 2 and tests implement in software.
 //!
 //! Each ceremony reads a [`State`] from the previous state disc (except
 //! `init`, which creates the first one) and produces an [`Outcome`]: the new
 //! state and the transcript, both of which the caller burns to the next disc.
 
 pub mod drill;
+pub mod hsm;
 pub mod init;
 
 use coldroot_core::{
@@ -18,9 +21,9 @@ use coldroot_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use yubihsm::{Client, object};
 
 pub use coldroot_core::transcript::Participant;
+pub use hsm::{Hsm, HsmError, KeyId};
 
 /// How the operator and witnesses take part in a ceremony.
 pub trait Console {
@@ -60,13 +63,13 @@ pub enum CeremonyError {
     #[error("shares: {0}")]
     Share(#[from] ShareError),
     #[error("HSM: {0}")]
-    Hsm(#[from] coldroot_hsm::Error),
-    #[error("wrapped key blob for key {key_id} is malformed")]
-    MalformedBlob { key_id: u16 },
+    Hsm(#[from] HsmError),
+    #[error("wrapped blob for key {key_id} restored key {restored} instead")]
+    WrongKeyRestored { key_id: KeyId, restored: KeyId },
     #[error("restored key {key_id} has a different public key than recorded")]
-    PublicKeyMismatch { key_id: u16 },
+    PublicKeyMismatch { key_id: KeyId },
     #[error("restored key {key_id} produced a signature that does not verify")]
-    BadSignature { key_id: u16 },
+    BadSignature { key_id: KeyId },
     #[error("state has no keys")]
     NoKeys,
 }
@@ -74,7 +77,7 @@ pub enum CeremonyError {
 /// A root key as kept on the state disc.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredKey {
-    pub id: u16,
+    pub id: KeyId,
     pub label: String,
     /// SEC1 uncompressed P-256 point.
     #[serde(with = "hex::serde")]
@@ -115,29 +118,9 @@ fn verifier_committed(verifier: &Verifier) -> Event {
     }
 }
 
-/// Public key of `key_id` as an uncompressed SEC1 point, which is the HSM's
-/// raw `x || y` with the 0x04 prefix the HSM leaves off.
-fn public_key(client: &Client, key_id: u16) -> Result<Vec<u8>, CeremonyError> {
-    let raw = client.get_public_key(key_id)?.into_vec();
-    let mut sec1 = Vec::with_capacity(raw.len() + 1);
-    sec1.push(0x04);
-    sec1.extend_from_slice(&raw);
-    Ok(sec1)
-}
-
-fn reset(client: &Client) -> Result<Event, CeremonyError> {
-    client.reset_device()?;
+fn reset(hsm: &mut dyn Hsm) -> Result<Event, CeremonyError> {
+    hsm.reset()?;
     Ok(Event::Performed(
         coldroot_core::transcript::Operation::ResetHsm,
     ))
-}
-
-fn wrapped(key: &StoredKey) -> Result<coldroot_hsm::Wrapped, CeremonyError> {
-    let message = yubihsm::wrap::Message::from_vec(key.blob.clone())
-        .map_err(|_| CeremonyError::MalformedBlob { key_id: key.id })?;
-    Ok(coldroot_hsm::Wrapped {
-        object_type: object::Type::AsymmetricKey,
-        object_id: key.id,
-        message,
-    })
 }

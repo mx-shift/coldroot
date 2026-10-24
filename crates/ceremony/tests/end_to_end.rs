@@ -1,20 +1,87 @@
 //! Init on one HSM, then a drill on a different, empty HSM, with shares
 //! presented from discs and from paper.
+//!
+//! The HSM here is a software stand-in that implements [`Hsm`] just well
+//! enough to tell a right wrap key from a wrong one. `coldroot-hsm` runs the
+//! same ceremonies against the YubiHSM mock.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use coldroot_ceremony::{
-    Aborted, Console, Participant, ShareInput, State, drill,
+    Aborted, Console, Hsm, HsmError, KeyId, Participant, ShareInput, State, drill,
     init::{self, InitConfig, KeySpec},
 };
 use coldroot_core::{
     shares::KeyShare,
     transcript::{Anchor, Event, ParticipantId, verify},
 };
-use yubihsm::{Client, Connector, Credentials};
+use p256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
+use rand_core::OsRng;
+use sha2::{Digest, Sha256};
 
-fn fresh_hsm() -> Client {
-    Client::open(Connector::mockhsm(), Credentials::default(), true).unwrap()
+/// Keys live in a map; a "wrapped" blob is a tag of the wrap key, the key ID
+/// and the plain scalar. Nothing about it is secure; it only has to behave
+/// like a device that refuses blobs made under a different wrap key.
+#[derive(Default)]
+struct FakeHsm {
+    wrap_key: Option<[u8; 32]>,
+    keys: BTreeMap<KeyId, SigningKey>,
+}
+
+impl FakeHsm {
+    fn tag(&self) -> Result<[u8; 32], HsmError> {
+        let wrap_key = self.wrap_key.ok_or("no wrap key installed")?;
+        Ok(Sha256::digest([b"fake wrap".as_slice(), &wrap_key].concat()).into())
+    }
+}
+
+impl Hsm for FakeHsm {
+    fn install_wrap_key(&mut self, key: &[u8; 32]) -> Result<(), HsmError> {
+        self.wrap_key = Some(*key);
+        Ok(())
+    }
+
+    fn generate_signing_key(&mut self, id: KeyId, _label: &str) -> Result<(), HsmError> {
+        self.keys.insert(id, SigningKey::random(&mut OsRng));
+        Ok(())
+    }
+
+    fn public_key(&mut self, id: KeyId) -> Result<Vec<u8>, HsmError> {
+        let key = self.keys.get(&id).ok_or("no such key")?;
+        Ok(key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec())
+    }
+
+    fn export_wrapped(&mut self, id: KeyId) -> Result<Vec<u8>, HsmError> {
+        let tag = self.tag()?;
+        let key = self.keys.get(&id).ok_or("no such key")?;
+        Ok([&tag[..], &id.to_be_bytes(), &key.to_bytes()].concat())
+    }
+
+    fn import_wrapped(&mut self, blob: &[u8]) -> Result<KeyId, HsmError> {
+        let (tag, rest) = blob.split_at_checked(32).ok_or("short blob")?;
+        if tag != self.tag()? {
+            return Err("blob was wrapped under a different key".into());
+        }
+        let (id, scalar) = rest.split_at_checked(2).ok_or("short blob")?;
+        let id = KeyId::from_be_bytes(id.try_into()?);
+        self.keys.insert(id, SigningKey::from_slice(scalar)?);
+        Ok(id)
+    }
+
+    fn sign_prehash(&mut self, id: KeyId, digest: &[u8; 32]) -> Result<Vec<u8>, HsmError> {
+        let key = self.keys.get(&id).ok_or("no such key")?;
+        let signature: p256::ecdsa::Signature = key.sign_prehash(digest)?;
+        Ok(signature.to_der().as_bytes().to_vec())
+    }
+
+    fn reset(&mut self) -> Result<(), HsmError> {
+        *self = Self::default();
+        Ok(())
+    }
 }
 
 fn people() -> Vec<Participant> {
@@ -74,8 +141,8 @@ fn run_init(console: &mut Scripted) -> State {
             },
         ],
     };
-    let hsm = fresh_hsm();
-    let outcome = init::run(&config, &hsm, console).unwrap();
+    let mut hsm = FakeHsm::default();
+    let outcome = init::run(&config, &mut hsm, console).unwrap();
 
     assert_eq!(console.issued.len(), 5);
     assert_eq!(outcome.state.keys.len(), 2);
@@ -85,8 +152,8 @@ fn run_init(console: &mut Scripted) -> State {
         verify(&anchor, &outcome.transcript).unwrap(),
         outcome.state.transcript_head
     );
-    // The HSM was wiped: a fresh session finds no key.
-    assert!(fresh_hsm().get_public_key(0x100).is_err());
+    // The HSM was wiped.
+    assert!(hsm.public_key(0x100).is_err());
     outcome.state
 }
 
@@ -107,8 +174,8 @@ fn init_then_drill_on_a_different_hsm() {
         ),
         (4, ShareInput::Disc(console.issued[3].1.clone())),
     ]);
-    let hsm = fresh_hsm();
-    let outcome = drill::run(&state, people(), &hsm, &mut console).unwrap();
+    let mut hsm = FakeHsm::default();
+    let outcome = drill::run(&state, people(), &mut hsm, &mut console).unwrap();
 
     let anchor = Anchor::Previous(state.transcript_head);
     assert_eq!(
@@ -131,7 +198,7 @@ fn init_then_drill_on_a_different_hsm() {
         )
     )));
     assert_eq!(outcome.state.keys, state.keys);
-    assert!(fresh_hsm().get_public_key(0x100).is_err());
+    assert!(hsm.public_key(0x100).is_err());
 }
 
 #[test]
@@ -158,7 +225,7 @@ fn drill_rejects_bad_shares_and_keeps_asking() {
         (2, ShareInput::Disc(console.issued[1].1.clone())),
         (5, ShareInput::Disc(console.issued[4].1.clone())),
     ]);
-    let outcome = drill::run(&state, people(), &fresh_hsm(), &mut console).unwrap();
+    let outcome = drill::run(&state, people(), &mut FakeHsm::default(), &mut console).unwrap();
 
     let notices = console.notices.join("\n");
     assert!(notices.contains("already been presented"), "{notices}");
@@ -178,7 +245,7 @@ fn drill_fails_when_the_quorum_gives_up() {
     let state = run_init(&mut console);
     console.to_present = VecDeque::from([(1, ShareInput::Disc(console.issued[0].1.clone()))]);
     assert!(matches!(
-        drill::run(&state, people(), &fresh_hsm(), &mut console),
+        drill::run(&state, people(), &mut FakeHsm::default(), &mut console),
         Err(coldroot_ceremony::CeremonyError::Aborted(_))
     ));
 }

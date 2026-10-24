@@ -7,17 +7,16 @@ use coldroot_core::{
 };
 use jiff::Timestamp;
 use rand_core::{OsRng, RngCore};
-use yubihsm::{Capability, Client, Domain, asymmetric, object};
 
 use crate::{
-    CeremonyError, Console, Outcome, State, StoredKey, public_key, reset, sha256,
+    CeremonyError, Console, Hsm, KeyId, Outcome, State, StoredKey, reset, sha256,
     verifier_committed,
 };
 
-/// A root key to generate. All keys are P-256, exportable only under wrap.
+/// A root key to generate; see [`Hsm::generate_signing_key`].
 #[derive(Clone, Debug)]
 pub struct KeySpec {
-    pub id: u16,
+    pub id: KeyId,
     pub label: String,
 }
 
@@ -37,7 +36,7 @@ const FIRST_GENERATION: u32 = 1;
 
 pub fn run(
     config: &InitConfig,
-    client: &Client,
+    hsm: &mut dyn Hsm,
     console: &mut dyn Console,
 ) -> Result<Outcome, CeremonyError> {
     if config.keys.is_empty() {
@@ -94,20 +93,14 @@ pub fn run(
         })?;
     }
 
-    coldroot_hsm::install_wrap_key(client, wrap_key.as_bytes())?;
+    hsm.install_wrap_key(wrap_key.as_bytes())?;
     transcript.append(Event::Performed(Operation::InstallWrapKey))?;
     drop(wrap_key);
 
     let mut keys = Vec::with_capacity(config.keys.len());
     for spec in &config.keys {
-        client.generate_asymmetric_key(
-            spec.id,
-            object::Label::from(spec.label.as_str()),
-            Domain::DOM1,
-            Capability::SIGN_ECDSA | Capability::EXPORTABLE_UNDER_WRAP,
-            asymmetric::Algorithm::EcP256,
-        )?;
-        let public_key = public_key(client, spec.id)?;
+        hsm.generate_signing_key(spec.id, &spec.label)?;
+        let public_key = hsm.public_key(spec.id)?;
         transcript.append(Event::Performed(Operation::GenerateKey {
             key_id: spec.id,
             label: spec.label.clone(),
@@ -132,16 +125,15 @@ pub fn run(
         });
     }
 
-    let ids: Vec<object::Id> = keys.iter().map(|k| k.id).collect();
-    for (key, wrapped) in keys.iter_mut().zip(coldroot_hsm::backup(client, &ids)?) {
-        key.blob = wrapped.message.into_vec();
+    for key in &mut keys {
+        key.blob = hsm.export_wrapped(key.id)?;
         transcript.append(Event::Performed(Operation::ExportWrapped {
             key_id: key.id,
             blob_sha256: sha256(&key.blob),
         }))?;
     }
 
-    transcript.append(reset(client)?)?;
+    transcript.append(reset(hsm)?)?;
     transcript.append(Event::CeremonyEnded)?;
 
     Ok(Outcome {

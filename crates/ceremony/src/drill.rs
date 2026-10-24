@@ -13,17 +13,15 @@ use coldroot_core::{
     transcript::{Anchor, Confirmation, Event, Operation, Participant, Transcript},
 };
 use p256::ecdsa::{Signature, VerifyingKey, signature::hazmat::PrehashVerifier};
-use yubihsm::Client;
 
 use crate::{
-    CeremonyError, Console, Outcome, ShareInput, State, public_key, reset, sha256,
-    verifier_committed, wrapped,
+    CeremonyError, Console, Hsm, Outcome, ShareInput, State, reset, sha256, verifier_committed,
 };
 
 pub fn run(
     state: &State,
     participants: Vec<Participant>,
-    client: &Client,
+    hsm: &mut dyn Hsm,
     console: &mut dyn Console,
 ) -> Result<Outcome, CeremonyError> {
     if state.keys.is_empty() {
@@ -73,17 +71,18 @@ pub fn run(
 
     let wrap_key = verifier.combine(&accepted)?;
     drop(accepted);
-    coldroot_hsm::install_wrap_key(client, wrap_key.as_bytes())?;
+    hsm.install_wrap_key(wrap_key.as_bytes())?;
     transcript.append(Event::Performed(Operation::InstallWrapKey))?;
     drop(wrap_key);
 
-    let blobs = state
-        .keys
-        .iter()
-        .map(wrapped)
-        .collect::<Result<Vec<_>, _>>()?;
-    coldroot_hsm::restore(client, &blobs)?;
     for key in &state.keys {
+        let restored = hsm.import_wrapped(&key.blob)?;
+        if restored != key.id {
+            return Err(CeremonyError::WrongKeyRestored {
+                key_id: key.id,
+                restored,
+            });
+        }
         transcript.append(Event::Performed(Operation::ImportWrapped {
             key_id: key.id,
         }))?;
@@ -92,12 +91,12 @@ pub fn run(
     // Each key must still be the key that was recorded, and must still sign.
     let challenge = sha256(&[b"coldroot drill".as_slice(), &state.transcript_head].concat());
     for key in &state.keys {
-        if public_key(client, key.id)? != key.public_key {
+        if hsm.public_key(key.id)? != key.public_key {
             return Err(CeremonyError::PublicKeyMismatch { key_id: key.id });
         }
         let verifying_key = VerifyingKey::from_sec1_bytes(&key.public_key)
             .map_err(|_| CeremonyError::PublicKeyMismatch { key_id: key.id })?;
-        let signature = client.sign_ecdsa_prehash_raw(key.id, challenge.to_vec())?;
+        let signature = hsm.sign_prehash(key.id, &challenge)?;
         Signature::from_der(&signature)
             .and_then(|sig| verifying_key.verify_prehash(&challenge, &sig))
             .map_err(|_| CeremonyError::BadSignature { key_id: key.id })?;
@@ -106,7 +105,7 @@ pub fn run(
         }))?;
     }
 
-    transcript.append(reset(client)?)?;
+    transcript.append(reset(hsm)?)?;
     transcript.append(Event::CeremonyEnded)?;
 
     Ok(Outcome {

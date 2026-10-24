@@ -128,7 +128,6 @@ name = "coldroot-ceremony"
 version = "0.1.0"
 dependencies = [
  "coldroot-core",
- "coldroot-hsm",
  "hex",
  "jiff",
  "p256",
@@ -137,8 +136,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.21",
- "yubihsm",
- "zeroize",
 ]
 
 [[package]]
@@ -161,6 +158,8 @@ dependencies = [
 name = "coldroot-hsm"
 version = "0.1.0"
 dependencies = [
+ "coldroot-ceremony",
+ "coldroot-core",
  "yubihsm",
 ]
 
