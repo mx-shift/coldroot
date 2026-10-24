@@ -124,6 +124,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "coldroot-ceremony"
+version = "0.1.0"
+dependencies = [
+ "coldroot-core",
+ "hex",
+ "jiff",
+ "p256",
+ "rand_core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "coldroot-core"
 version = "0.1.0"
 dependencies = [
@@ -143,6 +158,8 @@ dependencies = [
 name = "coldroot-hsm"
 version = "0.1.0"
 dependencies = [
+ "coldroot-ceremony",
+ "coldroot-core",
  "yubihsm",
 ]
 

@@ -63,12 +63,70 @@ pub struct Participant {
     pub name: String,
 }
 
+/// Index into the participant list declared when the ceremony started.
+pub type ParticipantId = u8;
+
+/// What a participant attested to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "confirmed", rename_all = "snake_case")]
+pub enum Confirmation {
+    /// The machine clock matches an independent time source.
+    ClockCorrect,
+    /// The custodian has recorded their share and taken custody of it.
+    ShareRecorded { custodian: u8 },
+    /// The fingerprint of a newly generated key was recorded.
+    PublicKeyRecorded { key_id: u16 },
+}
+
+/// A state-changing operation on the HSM.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Operation {
+    InstallWrapKey,
+    GenerateKey {
+        key_id: u16,
+        label: String,
+        #[serde(with = "hex::serde")]
+        public_key_sha256: Hash,
+    },
+    ExportWrapped {
+        key_id: u16,
+        #[serde(with = "hex::serde")]
+        blob_sha256: Hash,
+    },
+    ImportWrapped {
+        key_id: u16,
+    },
+    /// A restored key produced a signature that verified against the public
+    /// key recorded when it was generated.
+    TestSignatureVerified {
+        key_id: u16,
+    },
+    ResetHsm,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     CeremonyStarted {
         participants: Vec<Participant>,
     },
+    Confirmed {
+        by: ParticipantId,
+        what: Confirmation,
+    },
+    /// The verifier in use, so a tampered state disc breaks the chain.
+    VerifierCommitted {
+        generation: u32,
+        #[serde(with = "hex::serde")]
+        sha256: Hash,
+    },
+    /// A custodian's share was presented and matched the verifier.
+    ShareAccepted {
+        custodian: u8,
+        by: ParticipantId,
+    },
+    Performed(Operation),
     ExceptionStarted {
         reason: String,
     },
@@ -110,6 +168,8 @@ pub enum TranscriptError {
     Malformed { seq: u64, reason: &'static str },
     #[error("entry {seq} is earlier than the entry before it")]
     TimeWentBackwards { seq: u64 },
+    #[error("entry {seq} names participant {id}, who was not declared")]
+    UnknownParticipant { seq: u64, id: ParticipantId },
 }
 
 /// Where the transcript is in its life cycle; enforces the event grammar.
@@ -124,6 +184,7 @@ enum Phase {
 #[derive(Debug)]
 struct Grammar {
     phase: Phase,
+    participants: usize,
     last_time: Option<Timestamp>,
 }
 
@@ -131,6 +192,7 @@ impl Grammar {
     fn new() -> Self {
         Self {
             phase: Phase::NotStarted,
+            participants: 0,
             last_time: None,
         }
     }
@@ -145,9 +207,10 @@ impl Grammar {
         }
         let next = match (self.phase, event) {
             (NotStarted, Event::CeremonyStarted { participants }) => {
-                if participants.is_empty() {
-                    return malformed("a ceremony needs at least one participant");
+                if participants.is_empty() || participants.len() > usize::from(ParticipantId::MAX) {
+                    return malformed("a ceremony needs 1 to 255 participants");
                 }
+                self.participants = participants.len();
                 Running
             }
             (NotStarted, _) => return malformed("first event must be ceremony_started"),
@@ -168,6 +231,14 @@ impl Grammar {
                 return malformed("exception must end before the ceremony");
             }
             (Running, Event::CeremonyEnded) => Ended,
+
+            (phase, Event::Confirmed { by, .. } | Event::ShareAccepted { by, .. }) => {
+                if usize::from(*by) >= self.participants {
+                    return Err(TranscriptError::UnknownParticipant { seq, id: *by });
+                }
+                phase
+            }
+            (phase, Event::VerifierCommitted { .. } | Event::Performed(_)) => phase,
         };
         self.phase = next;
         self.last_time = Some(time);
@@ -437,6 +508,31 @@ mod tests {
             exit_status: 0,
         };
         assert!(tr.append_at(t(1), cmd).is_err());
+    }
+
+    #[test]
+    fn unknown_participant_is_refused() {
+        let mut tr = Transcript::new(&genesis());
+        tr.append_at(t(0), started()).unwrap();
+        tr.append_at(
+            t(1),
+            Event::Confirmed {
+                by: 1,
+                what: Confirmation::ClockCorrect,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            tr.append_at(
+                t(2),
+                Event::ShareAccepted {
+                    custodian: 1,
+                    by: 2
+                }
+            )
+            .unwrap_err(),
+            TranscriptError::UnknownParticipant { seq: 2, id: 2 }
+        );
     }
 
     #[test]

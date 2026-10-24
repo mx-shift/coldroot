@@ -16,6 +16,10 @@
 //!   it could forge a share that passes the check; the HSM would then fail to
 //!   unwrap the keys, so the attack is a denial of service, not a key leak.
 //!
+//! Shares and verifiers carry a generation number, which a reshare ceremony
+//! increments, so a share from a superseded set is reported as such rather
+//! than as a mysterious verification failure.
+//!
 //! Each share is an index, a secret value and a blinding value. Custodians
 //! transcribe it as eight lines of hex, each ending in a check byte, so a typo
 //! is reported against the line it is on before the Pedersen check runs.
@@ -80,10 +84,14 @@ pub enum ShareError {
     LineCheckFailed { line: usize },
     #[error("verifier is malformed")]
     MalformedVerifier,
+    #[error("share disc record is malformed")]
+    MalformedRecord,
     #[error("share {0} is not a valid share")]
     Malformed(u8),
     #[error("share {0} does not match the verifier")]
     Unverified(u8),
+    #[error("share is from generation {share}, the current generation is {current}")]
+    WrongGeneration { share: u32, current: u32 },
     #[error("share {0} was entered twice")]
     Duplicate(u8),
     #[error("need {needed} shares, have {have}")]
@@ -145,17 +153,21 @@ impl WrapKey {
     /// Split into `limit` shares, any `threshold` of which reconstruct the key.
     pub fn split<R: RngCore + CryptoRng>(
         &self,
+        generation: u32,
         threshold: u8,
         limit: u8,
         rng: &mut R,
     ) -> Result<Split, ShareError> {
-        Ok(self.split_with_blinder(threshold, limit, rng)?.0)
+        Ok(self
+            .split_with_blinder(generation, threshold, limit, rng)?
+            .0)
     }
 
     /// `split`, also returning the blinder `b_0` of the key's commitment, so
     /// tests can open it.
     fn split_with_blinder<R: RngCore + CryptoRng>(
         &self,
+        generation: u32,
         threshold: u8,
         limit: u8,
         rng: &mut R,
@@ -175,6 +187,7 @@ impl WrapKey {
         }
 
         let verifier = Verifier {
+            generation,
             threshold,
             limit,
             commitments: a
@@ -189,6 +202,7 @@ impl WrapKey {
                 let mut value = Zeroizing::new(eval(&a, &x));
                 let mut blinder = Zeroizing::new(eval(&b, &x));
                 let share = KeyShare {
+                    generation,
                     index,
                     value: value.to_repr().into(),
                     blinder: blinder.to_repr().into(),
@@ -212,6 +226,7 @@ impl WrapKey {
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct KeyShare {
+    generation: u32,
     index: u8,
     value: [u8; KEY_LEN],
     blinder: [u8; KEY_LEN],
@@ -219,13 +234,18 @@ pub struct KeyShare {
 
 impl std::fmt::Debug for KeyShare {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "KeyShare({}, <redacted>)", self.index)
+        write!(
+            f,
+            "KeyShare(gen {}, #{}, <redacted>)",
+            self.generation, self.index
+        )
     }
 }
 
-fn line_check(index: u8, line: u8, bytes: &[u8]) -> u8 {
+fn line_check(generation: u32, index: u8, line: u8, bytes: &[u8]) -> u8 {
     let mut h = Sha256::new();
     h.update(LINE_CHECK_DOMAIN);
+    h.update(generation.to_be_bytes());
     h.update([index, line]);
     h.update(bytes);
     h.finalize()[0]
@@ -243,6 +263,10 @@ fn split_line_label(text: &str) -> (Option<usize>, &str) {
 }
 
 impl KeyShare {
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
     pub fn index(&self) -> u8 {
         self.index
     }
@@ -255,8 +279,9 @@ impl KeyShare {
     }
 
     /// The share as custodians transcribe it: numbered lines of four 4-digit
-    /// hex groups, each followed by a check byte bound to the share index and
-    /// line number.
+    /// hex groups, each followed by a check byte bound to the generation,
+    /// share index and line number. The sheet's heading, which names the
+    /// generation and index, is the caller's to print.
     pub fn to_lines(&self) -> Zeroizing<Vec<Zeroizing<String>>> {
         let body = self.body();
         Zeroizing::new(
@@ -269,16 +294,22 @@ impl KeyShare {
                     for group in chunk.chunks(2) {
                         write!(out, " {:02x}{:02x}", group[0], group[1]).unwrap();
                     }
-                    write!(out, "  {:02x}", line_check(self.index, line as u8, chunk)).unwrap();
+                    write!(
+                        out,
+                        "  {:02x}",
+                        line_check(self.generation, self.index, line as u8, chunk)
+                    )
+                    .unwrap();
                     out
                 })
                 .collect(),
         )
     }
 
-    /// Parse transcribed lines for share `index`. Leading line numbers and
-    /// whitespace are optional. Errors name the first line with a problem.
-    pub fn parse(index: u8, lines: &[&str]) -> Result<Self, ShareError> {
+    /// Parse transcribed lines for share `index` of `generation`. Leading
+    /// line numbers and whitespace are optional. Errors name the first line
+    /// with a problem.
+    pub fn parse(generation: u32, index: u8, lines: &[&str]) -> Result<Self, ShareError> {
         if index == 0 {
             return Err(ShareError::BadIndex);
         }
@@ -300,12 +331,13 @@ impl KeyShare {
             hex::decode_to_slice(digits.as_bytes(), &mut raw[..])
                 .map_err(|_| ShareError::MalformedLine { line })?;
             let (bytes, check) = raw.split_at(LINE_LEN);
-            if line_check(index, line as u8, bytes) != check[0] {
+            if line_check(generation, index, line as u8, bytes) != check[0] {
                 return Err(ShareError::LineCheckFailed { line });
             }
             body[i * LINE_LEN..line * LINE_LEN].copy_from_slice(bytes);
         }
         let mut share = Self {
+            generation,
             index,
             value: [0; KEY_LEN],
             blinder: [0; KEY_LEN],
@@ -315,12 +347,49 @@ impl KeyShare {
         Ok(share)
     }
 
+    /// The share as written to a custodian's share disc.
+    pub fn to_json(&self) -> Zeroizing<String> {
+        let record = ShareRecord {
+            generation: self.generation,
+            index: self.index,
+            value: self.value,
+            blinder: self.blinder,
+        };
+        Zeroizing::new(serde_json::to_string(&record).expect("record serializes"))
+    }
+
+    /// Read a share from a share disc.
+    pub fn from_json(json: &str) -> Result<Self, ShareError> {
+        let record: Zeroizing<ShareRecord> =
+            Zeroizing::new(serde_json::from_str(json).map_err(|_| ShareError::MalformedRecord)?);
+        if record.index == 0 {
+            return Err(ShareError::BadIndex);
+        }
+        Ok(Self {
+            generation: record.generation,
+            index: record.index,
+            value: record.value,
+            blinder: record.blinder,
+        })
+    }
+
     fn scalars(&self) -> Result<(Zeroizing<Scalar>, Zeroizing<Scalar>), ShareError> {
         let malformed = || ShareError::Malformed(self.index);
         let value = nonzero_scalar(&self.value).ok_or_else(malformed)?;
         let blinder = nonzero_scalar(&self.blinder).ok_or_else(malformed)?;
         Ok((Zeroizing::new(value), Zeroizing::new(blinder)))
     }
+}
+
+/// On-disc form of a share.
+#[derive(Serialize, Deserialize, Zeroize)]
+struct ShareRecord {
+    generation: u32,
+    index: u8,
+    #[serde(with = "hex::serde")]
+    value: [u8; KEY_LEN],
+    #[serde(with = "hex::serde")]
+    blinder: [u8; KEY_LEN],
 }
 
 /// A curve point serialized as compressed SEC1 hex.
@@ -347,6 +416,7 @@ impl<'de> Deserialize<'de> for Commitment {
 /// Public Pedersen commitments, stored on the state disc.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Verifier {
+    pub generation: u32,
     pub threshold: u8,
     pub limit: u8,
     /// One commitment `g^a_k · h^b_k` per polynomial coefficient, lowest
@@ -375,6 +445,12 @@ impl Verifier {
     /// Check `share` opens to the commitments: `g^v · h^b == Π C_k^(i^k)`.
     pub fn check(&self, share: &KeyShare) -> Result<(), ShareError> {
         self.check_well_formed()?;
+        if share.generation != self.generation {
+            return Err(ShareError::WrongGeneration {
+                share: share.generation,
+                current: self.generation,
+            });
+        }
         let index = share.index();
         if index == 0 || index > self.limit {
             return Err(ShareError::Unverified(index));
@@ -464,7 +540,7 @@ mod tests {
                 break k;
             }
         };
-        let (shares, verifier) = k.split(3, 5, &mut rng).unwrap();
+        let (shares, verifier) = k.split(1, 3, 5, &mut rng).unwrap();
         (k, shares, verifier)
     }
 
@@ -474,7 +550,7 @@ mod tests {
 
     fn parse(index: u8, lines: &[String]) -> Result<KeyShare, ShareError> {
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        KeyShare::parse(index, &refs)
+        KeyShare::parse(1, index, &refs)
     }
 
     #[test]
@@ -490,9 +566,10 @@ mod tests {
 
     #[test]
     fn line_check_known_answer() {
-        assert_eq!(line_check(1, 1, &[0; 8]), 0x7b);
-        assert_eq!(line_check(2, 1, &[0; 8]), 0xc6);
-        assert_eq!(line_check(1, 2, &[0; 8]), 0xb3);
+        assert_eq!(line_check(1, 1, 1, &[0; 8]), 0x8b);
+        assert_eq!(line_check(1, 2, 1, &[0; 8]), 0xd3);
+        assert_eq!(line_check(1, 1, 2, &[0; 8]), 0xcf);
+        assert_eq!(line_check(2, 1, 1, &[0; 8]), 0x24);
     }
 
     /// Byte-for-byte vectors from a fixed seed. If this test fails after a
@@ -509,20 +586,20 @@ mod tests {
         assert_eq!(
             lines(&shares[0]),
             [
-                "1: 1912 bb74 50af 456b  8d",
-                "2: 9244 0c8c 897a 5704  18",
-                "3: e107 953e ca37 3526  0f",
-                "4: 6bd7 6a1a 2880 f651  43",
-                "5: 74f5 a2c7 46a5 5ede  69",
-                "6: 1aed 14bb 3237 da97  03",
-                "7: 3e74 3aaf 5386 2a57  56",
-                "8: 488c dd70 44a0 9a65  5b",
+                "1: 1912 bb74 50af 456b  29",
+                "2: 9244 0c8c 897a 5704  fe",
+                "3: e107 953e ca37 3526  16",
+                "4: 6bd7 6a1a 2880 f651  1e",
+                "5: 74f5 a2c7 46a5 5ede  41",
+                "6: 1aed 14bb 3237 da97  ea",
+                "7: 3e74 3aaf 5386 2a57  01",
+                "8: 488c dd70 44a0 9a65  64",
             ]
         );
         assert_eq!(
             serde_json::to_string(&verifier).unwrap(),
             concat!(
-                r#"{"threshold":3,"limit":5,"commitments":["#,
+                r#"{"generation":1,"threshold":3,"limit":5,"commitments":["#,
                 r#""030975df5aca9434b9f57001547453124c851c29c709e4b7b12a038076d0f5127d","#,
                 r#""036d48625e7953ae7aead91003d5be50f97594100225ceb2793ae8bdb3956b7cf4","#,
                 r#""021a53b26de5b37dad0c53a8f9d4e3e5f076c45c7fd9cbc8b7f68df67df85ddf27"]}"#
@@ -533,7 +610,7 @@ mod tests {
     #[test]
     fn any_threshold_subset_reconstructs() {
         let k = key();
-        let (shares, verifier) = k.split(3, 5, &mut OsRng).unwrap();
+        let (shares, verifier) = k.split(1, 3, 5, &mut OsRng).unwrap();
         for subset in [[0, 1, 2], [0, 2, 4], [2, 3, 4], [4, 1, 3]] {
             let picked: Vec<_> = subset.iter().map(|&i| shares[i].clone()).collect();
             assert_eq!(verifier.combine(&picked).unwrap().as_bytes(), k.as_bytes());
@@ -545,9 +622,9 @@ mod tests {
     #[test]
     fn edge_parameters_work() {
         let k = key();
-        let (shares, verifier) = k.split(2, 2, &mut OsRng).unwrap();
+        let (shares, verifier) = k.split(1, 2, 2, &mut OsRng).unwrap();
         assert_eq!(verifier.combine(&shares).unwrap().as_bytes(), k.as_bytes());
-        let (shares, verifier) = k.split(3, 255, &mut OsRng).unwrap();
+        let (shares, verifier) = k.split(1, 3, 255, &mut OsRng).unwrap();
         assert_eq!(shares.last().unwrap().index(), 255);
         let picked = vec![shares[0].clone(), shares[127].clone(), shares[254].clone()];
         assert_eq!(verifier.combine(&picked).unwrap().as_bytes(), k.as_bytes());
@@ -556,13 +633,13 @@ mod tests {
     #[test]
     fn bad_parameters_are_refused() {
         let k = key();
-        assert!(k.split(1, 5, &mut OsRng).is_err());
-        assert!(k.split(6, 5, &mut OsRng).is_err());
+        assert!(k.split(1, 1, 5, &mut OsRng).is_err());
+        assert!(k.split(1, 6, 5, &mut OsRng).is_err());
     }
 
     #[test]
     fn below_threshold_is_refused() {
-        let (shares, verifier) = key().split(3, 5, &mut OsRng).unwrap();
+        let (shares, verifier) = key().split(1, 3, 5, &mut OsRng).unwrap();
         assert_eq!(
             verifier.combine(&shares[..2]).err(),
             Some(ShareError::NotEnough { needed: 3, have: 2 })
@@ -572,7 +649,7 @@ mod tests {
     #[test]
     fn key_commitment_opens_with_its_blinder() {
         let k = key();
-        let ((_, verifier), blinder) = k.split_with_blinder(3, 5, &mut OsRng).unwrap();
+        let ((_, verifier), blinder) = k.split_with_blinder(1, 3, 5, &mut OsRng).unwrap();
         let s = scalar(k.as_bytes()).unwrap();
         assert_eq!(verifier.commitments[0].0, commit(&s, &blinder));
         // And the blinder is doing its job: no commitment equals g^s.
@@ -583,8 +660,8 @@ mod tests {
     #[test]
     fn splits_of_the_same_key_differ() {
         let k = key();
-        let (shares_a, verifier_a) = k.split(3, 5, &mut OsRng).unwrap();
-        let (shares_b, verifier_b) = k.split(3, 5, &mut OsRng).unwrap();
+        let (shares_a, verifier_a) = k.split(1, 3, 5, &mut OsRng).unwrap();
+        let (shares_b, verifier_b) = k.split(1, 3, 5, &mut OsRng).unwrap();
         assert_ne!(verifier_a.commitments, verifier_b.commitments);
         assert_ne!(shares_a[0], shares_b[0]);
         // Shares from one split don't verify against the other.
@@ -596,7 +673,7 @@ mod tests {
 
     #[test]
     fn lines_round_trip() {
-        let (shares, verifier) = key().split(3, 5, &mut OsRng).unwrap();
+        let (shares, verifier) = key().split(1, 3, 5, &mut OsRng).unwrap();
         let typed = lines(&shares[3]);
         assert_eq!(typed.len(), SHARE_LINES);
         let parsed = parse(4, &typed).unwrap();
@@ -606,7 +683,7 @@ mod tests {
 
     #[test]
     fn line_labels_and_spacing_are_optional() {
-        let (shares, _) = key().split(3, 5, &mut OsRng).unwrap();
+        let (shares, _) = key().split(1, 3, 5, &mut OsRng).unwrap();
         let bare: Vec<String> = lines(&shares[0])
             .iter()
             .map(|l| l.split_once(": ").unwrap().1.replace(' ', ""))
@@ -620,18 +697,39 @@ mod tests {
     }
 
     #[test]
+    fn disc_record_round_trips() {
+        let (shares, verifier) = key().split(1, 3, 5, &mut OsRng).unwrap();
+        let json = shares[2].to_json();
+        assert!(json.contains(r#""generation":1"#) && json.contains(r#""index":3"#));
+        let back = KeyShare::from_json(&json).unwrap();
+        assert_eq!(back, shares[2]);
+        verifier.check(&back).unwrap();
+        assert_eq!(
+            KeyShare::from_json("{}").err(),
+            Some(ShareError::MalformedRecord)
+        );
+    }
+
+    #[test]
     fn typo_is_reported_on_its_line() {
         let (_, shares, _) = fixed_split();
-        let mut typed = lines(&shares[1]);
-        // Change one digit in the first group of line 6.
+        let typed = lines(&shares[1]);
+        // Try every other digit in one position of line 6. A single check
+        // byte misses 1 in 256 typos, so allow at most one of the fifteen to
+        // slip through; every detected one must name line 6.
         let pos = "6: ".len();
-        let c = typed[5].as_bytes()[pos];
-        let replacement = if c == b'0' { "1" } else { "0" };
-        typed[5].replace_range(pos..pos + 1, replacement);
-        assert_eq!(
-            parse(2, &typed).err(),
-            Some(ShareError::LineCheckFailed { line: 6 })
-        );
+        let original = typed[5].as_bytes()[pos];
+        let mut missed = 0;
+        for digit in b"0123456789abcdef".iter().filter(|&&d| d != original) {
+            let mut attempt = typed.clone();
+            attempt[5].replace_range(pos..pos + 1, std::str::from_utf8(&[*digit]).unwrap());
+            match parse(2, &attempt) {
+                Err(ShareError::LineCheckFailed { line: 6 }) => {}
+                Ok(_) => missed += 1,
+                other => panic!("unexpected result {other:?}"),
+            }
+        }
+        assert!(missed <= 1, "{missed} typos went undetected");
     }
 
     #[test]
@@ -684,7 +782,7 @@ mod tests {
     #[test]
     fn share_with_valid_line_checks_but_wrong_value_is_unverified() {
         // Someone who recomputes the line checks still can't pass the verifier.
-        let (shares, verifier) = key().split(3, 5, &mut OsRng).unwrap();
+        let (shares, verifier) = key().split(1, 3, 5, &mut OsRng).unwrap();
         let mut forged = shares[2].clone();
         forged.value[KEY_LEN - 1] ^= 1;
         assert_eq!(verifier.check(&forged), Err(ShareError::Unverified(3)));
@@ -692,15 +790,43 @@ mod tests {
 
     #[test]
     fn zero_share_values_are_refused() {
-        let (shares, verifier) = key().split(3, 5, &mut OsRng).unwrap();
+        let (shares, verifier) = key().split(1, 3, 5, &mut OsRng).unwrap();
         let mut zero = shares[0].clone();
         zero.value = [0; KEY_LEN];
         assert_eq!(verifier.check(&zero), Err(ShareError::Malformed(1)));
     }
 
     #[test]
+    fn wrong_generation_is_reported() {
+        let (shares, verifier) = key().split(1, 3, 5, &mut OsRng).unwrap();
+        let mut old = shares[0].clone();
+        old.generation = 0;
+        assert_eq!(
+            verifier.check(&old),
+            Err(ShareError::WrongGeneration {
+                share: 0,
+                current: 1
+            })
+        );
+        // The paper form also differs: lines from generation 1 don't parse as
+        // generation 2.
+        assert_eq!(
+            KeyShare::parse(
+                2,
+                1,
+                &lines(&shares[0])
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            )
+            .err(),
+            Some(ShareError::LineCheckFailed { line: 1 })
+        );
+    }
+
+    #[test]
     fn index_outside_limit_is_refused() {
-        let (shares, verifier) = key().split(3, 5, &mut OsRng).unwrap();
+        let (shares, verifier) = key().split(1, 3, 5, &mut OsRng).unwrap();
         let mut share = shares[0].clone();
         share.index = 6;
         assert_eq!(verifier.check(&share), Err(ShareError::Unverified(6)));
@@ -708,7 +834,7 @@ mod tests {
 
     #[test]
     fn duplicate_share_is_refused() {
-        let (shares, verifier) = key().split(3, 5, &mut OsRng).unwrap();
+        let (shares, verifier) = key().split(1, 3, 5, &mut OsRng).unwrap();
         let picked = vec![shares[0].clone(), shares[0].clone(), shares[1].clone()];
         assert_eq!(
             verifier.combine(&picked).err(),
@@ -718,7 +844,7 @@ mod tests {
 
     #[test]
     fn verifier_round_trips_through_json() {
-        let (shares, verifier) = key().split(3, 5, &mut OsRng).unwrap();
+        let (shares, verifier) = key().split(1, 3, 5, &mut OsRng).unwrap();
         let json = serde_json::to_string(&verifier).unwrap();
         let back: Verifier = serde_json::from_str(&json).unwrap();
         back.check(&shares[4]).unwrap();
@@ -726,7 +852,7 @@ mod tests {
 
     #[test]
     fn tampered_verifier_parameters_are_refused() {
-        let (shares, verifier) = key().split(3, 5, &mut OsRng).unwrap();
+        let (shares, verifier) = key().split(1, 3, 5, &mut OsRng).unwrap();
         let mut json: serde_json::Value = serde_json::to_value(&verifier).unwrap();
 
         json["threshold"] = 1.into();
@@ -759,14 +885,14 @@ mod tests {
 
     #[test]
     fn tampered_commitment_is_detected() {
-        let (shares, mut verifier) = key().split(3, 5, &mut OsRng).unwrap();
+        let (shares, mut verifier) = key().split(1, 3, 5, &mut OsRng).unwrap();
         verifier.commitments[0] = Commitment(ProjectivePoint::GENERATOR * Scalar::from(7u64));
         assert_eq!(verifier.check(&shares[0]), Err(ShareError::Unverified(1)));
     }
 
     #[test]
     fn invalid_point_in_json_is_refused() {
-        let json = r#"{"threshold":2,"limit":2,"commitments":["02ff","0200000000000000000000000000000000000000000000000000000000000000000000"]}"#;
+        let json = r#"{"generation":1,"threshold":2,"limit":2,"commitments":["02ff","0200000000000000000000000000000000000000000000000000000000000000000000"]}"#;
         assert!(serde_json::from_str::<Verifier>(json).is_err());
     }
 }
