@@ -1,0 +1,4 @@
+# Pinned so the ceremony image can be rebuilt bit-for-bit.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
