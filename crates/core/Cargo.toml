@@ -10,15 +10,16 @@ rust-version.workspace = true
 [dependencies]
 hex = { version = "0.4.3", features = ["serde"] }
 jiff = { version = "0.2.38", features = ["serde"] }
-p256 = { version = "0.13", features = ["hash2curve"] }
+p256 = "0.13"
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 # 0.10 to match the digest traits p256 0.13 uses for hash-to-curve.
 sha2 = "0.10"
 thiserror = "2.0.21"
-vsss-rs = "5"
-zeroize = "1.9.1"
+zeroize = { version = "1.9.1", features = ["derive"] }
 
 [dev-dependencies]
+# hash2curve is used only to re-derive the pinned blinder generator.
+p256 = { version = "0.13", features = ["hash2curve"] }
 rand_chacha = "0.3"
